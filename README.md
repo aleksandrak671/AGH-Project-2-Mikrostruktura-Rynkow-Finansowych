@@ -1,0 +1,1 @@
+# AGH-Project-2-Mikrostruktura-Rynkow-Finansowych

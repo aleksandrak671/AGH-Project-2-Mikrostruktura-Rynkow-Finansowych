@@ -45,7 +45,7 @@ The analysis covers two main topics:
 ## Project Structure
 
 ```
-├── Projekt 2 Mikrostruktura Rynków Finansowych.Rmd   # Main R Markdown source
+├── AGH-Project-2-Mikrostruktura-Rynkow-Finansowych.Rmd   # Main R Markdown source
 ├── spolkaD.csv             # Tick data – Company D
 ├── spolkaH.csv             # Tick data – Company H
 └── README.md

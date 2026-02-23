@@ -1,0 +1,676 @@
+---
+title: "Mikrostruktura Rynków Finansowych Projekt 2: Transakcyjne czasy trwania i Czasy trwania ceny"
+author: "Klaudia Rajca, Aleksandra Konopelska"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    number_sections: true
+    self_contained: true
+    encoding: UTF-8
+---
+
+```{r setup, include=FALSE}
+Sys.setlocale("LC_ALL", "Polish")
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(moments)    
+library(ACDm)       
+library(kableExtra)
+library(hms)
+```
+
+
+# Wstęp: Wybór danych i przygotowanie
+
+Celem naszego projektu jest analiza mikrostruktury rynku na przykładzie dwóch spółek o odmiennej charakterystyce płynnościowej i cenowej.
+
+Do analizy wybrałyśmy następujące spółki (na podstawie danych z naszego Projektu 1):
+
+* **Spółka H** (plik `spolkaH.csv`):
+    * Jest to spółka o wysokiej płynności, a cena akcji jest niska i wynosi średnio **7-9 PLN**.
+    * Liczba wszystkich wierszy (transakcji) w pliku: **1 157 316**.
+    * Liczba dni w pliku: ok. **495 dni** (2 lata).
+    * Średnia: 1 157 316 / 495 ≈ **2338** transakcji dziennie.
+
+* **Spółka D** (plik `spolkaD.csv`):
+    * Jest to spółka o niższej płynności w porównaniu do Spółki H, a cena akcji jest wysoka, oscylująca w granicach **400-500 PLN**.
+    * Liczba wierszy w pliku: **450 887**.
+    * Liczba dni w pliku: ok. **495 dni**.
+    * Średnia: 450 887 / 495 ≈ **910** transakcji dziennie.
+
+Spółka H ma ponad 2 razy więcej transakcji dziennie niż D. Dlatego nazywamy ją "płynną" lub "o wysokiej aktywności".
+
+Analiza w dalszej części pracy obejmuje wyznaczenie i porównanie **transakcyjnych czasów trwania** (czas między transakcjami) oraz **cenowych czasów trwania** (czas potrzebny na zmianę ceny).
+
+
+## Pakiety
+
+Pakiety, które wykorzystujemy w projekcie:
+
+```{r}
+library(tidyverse)  # pakiet do wczytywania, liczenia i wykresów (ggplot2)
+library(lubridate)  # pakiet do dat i czasu (godziny, minuty)
+library(moments)    # pakiet do liczenia skośności i kurtozy do tabeli statystyk
+library(ACDm)       # pakiet zawierający funkcję do usuwania sezonowości (diurnalAdj)
+library(kableExtra) # pakiet do tabeli
+library(hms)        # pakiet do formatu godzinowego (hh:mm:ss) na wykresach
+```
+
+
+# Część I – Transakcyjne czasy trwania
+
+## Konstrukcja szeregu czasowego
+
+Transakcyjny czas trwania ($d_t$) zdefiniowałyśmy jako okres upływający pomiędzy kolejnymi momentami zawarcia transakcji ($\tau_t$).
+
+Wzór:
+
+$$
+d_t = \begin{cases} 
+\tau_t - \tau_{t-1} & \text{dla } t \ge 2 \\
+\tau_1 & \text{dla } t = 1 
+\end{cases}
+$$
+
+Ten ciąg czasów $\{d_t\}$ tworzy proces, na którym będziemy pracować.
+
+W przypadku pierwszej transakcji w danym dniu, transakcyjny czas trwania obliczany jest jako czas, który upłynął od momentu otwarcia sesji giełdowej, czyli od godziny 09:00:00.
+
+Aby przygotować dane do analizy, wykonałyśmy trzy kluczowe kroki:
+
+1.  **Tylko notowania ciągłe:**
+
+Analizujemy wyłącznie godziny *09:00 – 16:50*. Odrzuciłyśmy fazę otwarcia i zamknięcia rynku, aby badać tylko stabilny handel.
+
+2.  **Łączenie transakcji (Agregacja):**
+
+Jeśli kilka transakcji wydarzyło się w tej samej sekundzie, traktujemy je jako jedną. Dzięki temu unikamy sytuacji, w której czas trwania wynosi zero ($d_t = 0$), co jest niezbędne, aby modele ekonometryczne (ACD) zadziałały poprawnie.
+
+3.  **Reset na koniec dnia:**
+
+Czasy trwania liczyłyśmy osobno dla każdego dnia. Nie liczyłyśmy czasu przez noc (między 16:50 a 9:00 rano kolejnego dnia), aby sztucznie nie zawyżać statystyk wielogodzinnymi przerwami.
+
+```{r}
+# funkcja pomocnicza do wczytania i wstępnego przetworzenia danych dla pojedynczej spółki
+przygotuj_dane <- function(sciezka, nazwa) {
+  
+  # wczytujemy dane
+  # (sep = ";") gdyż tak zapisane są dane z polskiej giełdy (GPW)
+  df <- read.csv(sciezka, sep = ";", stringsAsFactors = FALSE)
+  
+  # konwertujemy datę i czas do odpowiedniego formatu
+  df <- df %>%
+    mutate(
+      datetime = ymd_hms(paste(daty, sprintf("%06d", as.numeric(godz))))
+    ) %>%
+    # ograniczamy dane do godzin 09:00-16:50.
+    # odrzucamy fixing (otwarcie/zamknięcie), gdzie zlecenia są kumulowane i realizowane naraz
+    # to nie jest handel ciągły i zaburzyłoby nam statystyki średniego czasu oczekiwania
+    filter(hour(datetime) >= 9, 
+           (hour(datetime) < 16) | (hour(datetime) == 16 & minute(datetime) <= 50)) %>%
+
+    # agregujemy transakcje z tej samej sekundy (funkcja distinct).
+    # usuwamy duracje zerowe, bo modele ACD nie działają dla czasu równego 0 (dzielenie przez zero)
+    distinct(datetime, .keep_all = TRUE) %>%
+    arrange(datetime)
+  
+# obliczamy duracje zgodnie ze wzorem (od poprzedniej transakcji lub od 9:00)
+  df_dur <- df %>%
+    group_by(daty) %>% 
+    mutate(
+      # wyznaczamy punkt startowy sesji dla danego dnia (09:00:00)
+      otwarcie_sesji = ymd_hms(paste(daty, "09:00:00")),
+      
+      # zapisujemy czas poprzedniej transakcji
+      poprzedni_czas = lag(datetime),
+      
+      # liczymy durację: 
+      # jeśli poprzedni_czas to NA (czyli to pierwsza transakcja dnia), liczymy czas od 09:00:00
+      # w przeciwnym razie liczymy czas od poprzedniej transakcji
+      duracja = ifelse(is.na(poprzedni_czas),
+                       as.numeric(difftime(datetime, otwarcie_sesji, units = "secs")),
+                       as.numeric(difftime(datetime, poprzedni_czas, units = "secs")))
+    ) %>%
+    ungroup() %>%
+    filter(duracja > 0) # zostawiamy tylko dodatnie czasy
+
+  # podpisujemy dane nazwą spółki do tabeli
+  # by połączyć obie tabele w jedną i wiedzieć, który wiersz jest czyj
+  df_dur$Spolka <- nazwa
+  
+  return(df_dur)
+}
+
+# uruchamiamy funkcję dla obu plików:
+dane_H <- przygotuj_dane("spolkaH.csv", "Spółka H")
+dane_D <- przygotuj_dane("spolkaD.csv", "Spółka D")
+
+# scalamy (funkcja rbind = row bind) obie tabele jedna pod drugą
+# i tworzymy jedną dużą ramkę danych, co ułatwi rysowanie wspólnych wykresów w ggplot
+dane_razem <- rbind(dane_H, dane_D)
+```
+
+
+## Statystyki opisowe
+
+Poniższa tabela pokazuje statystyki opisowe transakcyjnych czasów trwania. Zwrócimy uwagę na relację odchylenia standardowego do średniej.
+
+Wysoka wartość odchylenia standardowego względem średniej potwierdza, że **dane nie są równomiernie rozłożone w czasie**. Transakcje występują nieregularnie (raz gęsto, raz rzadko), co jest charakterystyczną cechą danych wysokiej częstotliwości i uzasadnia zastosowanie modeli **ACD** do ich opisu.
+
+
+```{r}
+tabela_statystyk <- dane_razem %>%
+  group_by(Spolka) %>%
+  summarise(
+    N = n(),
+    Srednia = mean(duracja),
+    Mediana = median(duracja),
+    Min = min(duracja),
+    Max = max(duracja),
+    Odch_Std = sd(duracja),
+    Skosnosc = skewness(duracja),
+    Kurtoza = kurtosis(duracja),
+    Nadwyzkowe_Rozproszenie = sd(duracja) / mean(duracja)
+  )
+
+# tabela
+tabela_statystyk %>%
+  kable(digits = 3, caption = "Statystyki opisowe transakcyjnych czasów trwania")
+```
+
+**Wyniki powyższej tabeli:**
+
+* **Płynność (Szybkość handlu):** Spółka H jest znacznie bardziej płynna, co oznacza, że jej akcjami handluje się szybciej i łatwiej. Średni czas oczekiwania na kolejną transakcję wynosi **30,69 sekundy**, a dla Spółki D jest to ponad dwa razy więcej **72,29 sekundy**. Potwierdza to też liczebność próby ($N$): Spółka H ma ponad 2 razy więcej transakcji. Krótsze czasy trwania oznaczają wyższą intensywność handlu.
+
+* **Kształt rozkładu (Asymetria):** dla obu spółek widać dużą asymetrię prawostronną (dodatnia skośność). Wartość średniej jest znacznie wyższa od mediany (np. dla Spółki H: średnia ok. 31s vs mediana 11s). Oznacza to, że na rynku dominuje duża liczba transakcji zawieranych w krótkich odstępach czasu, ale zdarzają się też rzadkie, ekstremalnie długie przerwy w handlu (maksimum dla Spółki D to 5239 sekund, czyli prawie 1,5 godziny ciszy).
+
+* **Nierównomierność w czasie:** Dla obu spółek odchylenie standardowe przyjmuje wartości znacznie wyższe od średniej. Zgodnie z własnościami rozkładu wykładniczego (stosowanego jako punkt odniesienia), wartość oczekiwana powinna być równa odchyleniu standardowemu. Ta rozbieżność potwierdza, że dane nie są równomiernie rozłożone w czasie.
+
+**Wniosek:** Transakcje nie pojawiają się regularnie, lecz mają tendencję do występowania grupami/seriami (w klastrach): okresy ciszy przeplatają się z okresami większego handlu. Ponieważ transakcje nie pojawiają się w równym tempie, a ich intensywność ulega drastycznym zmianom w czasie, rozkłady czasów trwania charakteryzują się silnym nadwyżkowym rozproszeniem (odchylenie standardowe jest znacznie wyższe od średniej).
+    
+
+## Analiza sezonowości (Wykresy przekrojowych średnich)
+
+Nasza poniższa analiza przedstawia **wykresy przekrojowych średnich transakcyjnych czasów trwania** na przestrzeni sesji giełdowej.
+
+Celem tej analizy będzie zidentyfikowanie **sezonowości (cykliczności) śróddziennej**. Wykresy te pozwalają ocenić występowanie deterministycznego wzorca w danych, którego usunięcie jest konieczne przed przystąpieniem do modelowania czasów trwania.
+
+```{r}
+# przygotowujemy dane do wykresu
+sezonowosc <- dane_razem %>%
+  mutate(
+    # zaokrąglamy czas każdej transakcji w dół do pełnych 5 minut
+    # na przykład 09:12:45 = 09:10:00
+    czas_bin = floor_date(datetime, unit = "5 minutes"),
+    
+    # wyciągamy samą godzinę
+    # dzięki temu transakcje z 1 stycznia o 9:00 i z 15 marca o 9:00 trafią do tej samej "kategorii"
+    czas_dnia = hms::as_hms(czas_bin)
+  ) %>%
+  # grupujemy nasze dane: oddzielnie dla każdej spółki i dla każdego 5 minutowego okna w ciągu dnia
+  group_by(Spolka, czas_dnia) %>%
+  # dla każdego okna liczymy średnią z duracji (czasu oczekiwania)
+  summarise(Srednia_Duracja = mean(duracja), .groups = 'drop')
+
+# wykres
+ggplot(sezonowosc, aes(x = czas_dnia, y = Srednia_Duracja, color = Spolka)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Przekrojowe średnie transakcyjne czasy trwania",
+    subtitle = "Sezonowość wewnątrz sesji (interwały 5-minutowe)",
+    x = "Godziny sesji",
+    y = "Średni czas trwania (sekundy)"
+  ) +
+  theme_minimal() + 
+  # ustawiamy podziałkę na osi X co godzinę żeby było czytelnie
+  scale_x_time(breaks = scales::date_breaks("1 hour")) +
+  theme(legend.position = "bottom")
+```
+
+**Wyniki powyższego wykresu:**  
+
+Widoczna jest śróddzienna sezonowość transakcyjnych czasów trwania: średnie odstępy między transakcjami zmieniają się w trakcie sesji.
+
+- **Otwarcie sesji (ok. 9:00):** dla **Spółki D** widać wyraźny pik około godziny 9:00, czyli w pierwszych minutach po rozpoczęciu notowań ciągłych transakcje pojawiają się chwilami rzadziej (średnia przerwa między transakcjami jest większa). Taki efekt jest typowy dla początku sesji i częściej występuje dla mniej płynnych spółek.
+
+- **Środek dnia (ok. 12:00–14:00):** czasy trwania są większe (krzywe są wyżej), co oznacza rzadsze transakcje i niższą aktywność rynku.
+
+- **Końcówka sesji (po 15:00 do 16:50):** czasy trwania maleją (krzywe opadają), czyli transakcje znów pojawiają się częściej: typowo przed zamknięciem sesji.
+
+Linia dla **Spółki H** jest niżej, czyli średnie duracje są mniejsze (krótsze przerwy między transakcjami), co oznacza częstszy handel i większą płynność tej spółki.
+
+
+## Usuwanie śróddziennej cykliczności
+
+Przed przystąpieniem do modelowania czasów trwania usuniemy efekt śróddziennej cykliczności (sezonowości).
+
+W tym celu wykorzystujemy metodę **Elastycznej Formy Fouriera (Flexible Fourier Form – FFF).** Pozwala na płynne (gładkie) dopasowanie krzywej sezonowej przy użyciu funkcji trygonometrycznych. W przeciwieństwie do zwykłych średnich, nie tworzy "schodków", lecz ciągły wzorzec, co lepiej oddaje rzeczywistą dynamikę rynku.
+
+Zakładamy, że wzorce zachowań inwestorów mogą różnić się w zależności od dnia, dlatego w procesie modelowania sezonowości za pomocą Elastycznej Formy Fouriera (FFF) uwzględniono dzień tygodnia jako zmienną binarną.
+
+```{r}
+# funkcja do usuwania sezonowości przy użyciu pakietu ACDm (metoda Fouriera)
+usun_sezonowosc_pakietem <- function(dane_spolki) {
+
+  # 1. przygotowujemy dane do formatu wymaganego przez pakiet ACDm
+  # nazwy kolumn po angielsku: 'durations' i 'time'
+  df_temp <- data.frame(
+    durations = dane_spolki$duracja,
+    time = as.POSIXct(dane_spolki$datetime)
+  )
+
+  pdf(NULL) # zapobiega rysowaniu pustych wykresów w tle
+
+  # 2. uruchamiamy model raz dla CAŁEGO zbioru danych.
+  # Parametr aggregation = "weekdays" sprawia, że metoda FFF automatycznie 
+  # uwzględnia dni tygodnia jako zmienne binarne
+  wynik_adj <- ACDm::diurnalAdj(
+    df_temp,
+    method = "FFF",
+    aggregation = "weekdays" 
+  )
+
+  dev.off()
+
+  # 3. dopisujemy odsezonowane wyniki do oryginalnej tabeli
+  # adjDur = odsezonowane czasy trwania
+  dane_spolki$duracja_adj <- as.numeric(wynik_adj$adjDur)
+
+  return(dane_spolki)
+}
+
+# uruchamiamy funkcję dla obu spółek
+dane_H <- usun_sezonowosc_pakietem(dane_H)
+dane_D <- usun_sezonowosc_pakietem(dane_D)
+
+# sprawdzamy poprawność: średnia nowych danych powinna być bardzo bliska 1
+mean(dane_H$duracja_adj)
+mean(dane_D$duracja_adj)
+```
+
+Średnie wartości odsezonowanych danych wynoszą ok. 1 (odpowiednio 0,9996 i 0,9997 dla badanych spółek). Jest to wynik zgodny z teorią, ponieważ metoda Fouriera normalizuje wskaźniki sezonowości tak, aby ich średnia wynosiła 1. Oznacza to, że procedura usuwania cykliczności przebiegła pomyślnie.
+
+## Oszacowana składowa sezonowa (w kolejnych dniach tygodnia)
+
+Zakładamy, że wzorzec zachowania inwestorów może być inny w różne dni tygodnia. Dlatego poniższy wykres prezentuje kształt składowej sezonowej (czyli typowego przebiegu sesji) oszacowanej osobno dla każdego dnia tygodnia.
+
+Wykres ten pozwoli nam ocenić, w jakich godzinach handel przyspiesza (niskie wartości na wykresie), a w jakich zwalnia (wysokie wartości) = śróddziennej cykliczności.
+
+```{r}
+# oszacowana składowa sezonowa (dla obu spółek, osobno dla dni tygodnia)
+
+# 1. łączymy dane obu spółek w jedną dużą tabelę i wyliczamy składową sezonową
+dane_plot <- bind_rows(
+  dane_H %>% select(datetime, duracja, duracja_adj, Spolka),
+  dane_D %>% select(datetime, duracja, duracja_adj, Spolka)
+) %>%
+  mutate(
+    sezonowosc_sec = duracja / duracja_adj,
+    # wyciągamy dzień tygodnia, żeby mieć osobne wykresy
+    dzien_tygodnia = wday(datetime, label = TRUE, abbr = FALSE, week_start = 1),
+    # zaokrąglamy czas do 5 minut
+    czas_bin = floor_date(datetime, unit = "5 minutes"),
+    czas_dnia = hms::as_hms(czas_bin)
+  ) 
+
+# 2. liczymy średnią sezonowość dla każdego kawałka dnia
+sezonowosc_plot <- dane_plot %>%
+  group_by(Spolka, dzien_tygodnia, czas_dnia) %>%
+  summarise(Wartosc_Sezonowosci = mean(sezonowosc_sec, na.rm = TRUE), .groups = "drop")
+
+# 3. wykresy
+ggplot(sezonowosc_plot, aes(x = czas_dnia, y = Wartosc_Sezonowosci)) +
+  geom_line(color = "blue", linewidth = 0.8) +
+  facet_grid(Spolka ~ dzien_tygodnia) +
+  labs(
+    title = "Oszacowana składowa sezonowa – obie spółki",
+    subtitle = "Przekrojowe średnie czasy trwania (sekundy) w kolejnych dniach tygodnia",
+    x = "Godzina sesji",
+    y = "Oszacowana średnia duracja (s)"
+  ) +
+  theme_minimal() +
+  scale_x_time(
+    breaks = scales::date_breaks("2 hours"),
+    labels = scales::time_format("%H:%M"),
+    limits = c(hms::as_hms("09:00:00"), hms::as_hms("16:50:00"))
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Wykres prezentuje oszacowaną składową sezonową (średnią durację w sekundach w zależności od pory dnia), wyznaczoną osobno dla poszczególnych dni tygodnia. Dla obu spółek widoczny jest charakterystyczny wzorzec śróddzienny (kształt odwróconej "U"):
+
+ - **W środku sesji (ok. 12:00-14:00)** średnie czasy trwania są najwyższe, co oznacza spowolnienie handlu i rzadsze transakcje (typowe dla przerwy/lunchu).
+
+ - **Na początku i w końcówce sesji** duracje spadają, co świadczy o wzroście aktywności inwestorów i częstszym zawieraniu transakcji.
+
+Wartości składowej sezonowej są wyższe dla Spółki D (około 30–120 s) niż dla Spółki H (około 20–50 s), co potwierdza niższą płynność Spółki D.
+
+
+## Weryfikacja skuteczności (Średnie zmodyfikowane)
+
+W celu weryfikacji poprawności odsezonowania, sprawdzamy zachowanie średnich czasów trwania po modyfikacji (szereg d~t​). Jeśli nasz proces przebiegł pomyślnie, średnie w interwałach 5-minutowych powinny utracić kształt "U" i oscylować wokół wartości 1.
+
+```{r}
+dane_weryfikacja <- bind_rows(
+  dane_H %>% select(datetime, duracja_adj, Spolka),
+  dane_D %>% select(datetime, duracja_adj, Spolka)
+) %>%
+  mutate(
+    # zaokrąglamy czas transakcji w dół do pełnych 5 minut
+    czas_bin = floor_date(datetime, unit = "5 minutes"), 
+    # wyciągamy samą godzinę (bez daty) żeby nałożyć na siebie różne dni
+    czas_dnia = hms::as_hms(czas_bin)
+  ) %>%
+  # grupujemy dane osobno dla każdej spółki i każdego 5 minutowego okna
+  group_by(Spolka, czas_dnia) %>%
+  summarise(
+    n = n(), # liczymy ile było transakcji w tym oknie
+    Srednia_Adj = mean(duracja_adj), # liczymy średnią z odsezonowanych danych
+    .groups = "drop"
+  ) %>%
+  # zostawiamy tylko te momenty, gdzie było min 10 transakcji, żeby średnia była wiarygodna
+  filter(n >= 10) 
+
+ggplot(dane_weryfikacja, aes(x = czas_dnia, y = Srednia_Adj, color = Spolka)) +
+  geom_line(linewidth = 0.8) + 
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black") +
+  labs(
+    title = "Weryfikacja odsezonowania",
+    x = "Godzina",
+    y = "Średnia duracja_adj"
+  ) +
+  theme_minimal() +
+  scale_x_time(
+    breaks = scales::date_breaks("1 hour"),
+    labels = scales::time_format("%H:%M"),
+    limits = c(hms::as_hms("09:00:00"), hms::as_hms("16:50:00"))
+  ) +
+  coord_cartesian(ylim = c(0.8, 1.2))
+```
+
+**Wniosek:** 
+
+ - **Średnia ≈ 1:** średnie wartości zmodyfikowanych czasów trwania oscylują wokół poziomu 1 (oznaczonego linią przerywaną czarną). Potwierdza to poprawność normalizacji, ponieważ składniki sezonowości są skalowane tak, aby ich średnia wynosiła 1.
+
+ - **Eliminacja wzorca:** szereg czasowy utracił wyraźny kształt odwróconego "U". Dla obu spółek widoczne są jeszcze pewne odchylenia od poziomu 1 (wahania w zakresie ok. 0,7–1,2). Nie świadczy to jednak o nieskuteczności metody FFF. Należy pamiętać, że na komentowanym wykresie przedstawione są średnie, a rozkłady czasów trwania charakteryzują się grubymi ogonami. Pojedyncza obserwacja odstająca (np. wyjątkowo długa przerwa w handlu) ma znaczący wpływ na średnią i może ją silnie zaburzyć. Tego typu obserwacje odnoszą się zazwyczaj do początku lub końca sesji – stąd widoczne spadki i skoki średnich w tych momentach. Prawdopodobnie, gdyby na wykresie przedstawiono mediany zamiast średnich, tego rodzaju odchylenia by nie występowały. Niemniej, ogólny deterministyczny wzorzec śróddzienny został skutecznie wyeliminowany, a dane są gotowe do dalszej analizy.
+ 
+ 
+# Część II - Czasy trwania ceny
+
+Cenowy czas trwania dla progu $p_0$ definiujemy jako czas, jaki musi upłynąć, aby skumulowana zmiana ceny wyniosła co najmniej $p_0$ (w górę lub w dół). Po przekroczeniu progu "resetujemy" punkt odniesienia i zaczynamy liczyć kolejny epizod.
+
+**W tej części:**
+
+- badamy tylko notowania ciągłe 09:00–16:50 (jak w części 1),
+- wyznaczamy cenowe czasy trwania dla dwóch progów $p_0$ (1 gr i 5 gr),
+- dla jednego wspólnego progu tworzymy tabelę statystyk opisowych,
+- dla każdej spółki rysujemy przekrojowe średnie dla obu progów.
+
+
+## Przygotowanie danych cenowych (agregacja do sekundy)
+
+Najpierw wczytujemy dane i przygotowujemy serię cen w czasie — agregując do 1 sekundy (gdy jest kilka transakcji w tej samej sekundzie). Cena w sekundzie jest liczona jako średnia ważona wolumenem, co jest standardowe w tick-data.
+
+```{r}
+# funkcja do wczytania danych i przygotowania serii cenowej (1 cena na sekundę)
+przygotuj_dane_cenowe <- function(sciezka, nazwa) {
+
+  # wczytujemy plik CSV (separator ";" -> dane z GPW)
+  df <- read.csv(sciezka, sep = ";", stringsAsFactors = FALSE)
+
+  # kolumny z ceną i wolumenem
+  col_price <- "cena"
+  col_vol   <- "vol"
+
+  # tworzymy kolumnę datetime (data + godzina) i wybieramy kolumny ceny i wolumenu
+  df <- df %>%
+    mutate(
+      datetime = ymd_hms(paste(daty, sprintf("%06d", as.numeric(godz)))),
+      price = as.numeric(.data[[col_price]]),
+      vol   = as.numeric(.data[[col_vol]])
+    ) %>%
+    # zostawiamy tylko notowania ciągłe 09:00-16:50 (jak w naszej części 1)
+    filter(hour(datetime) >= 9,
+           (hour(datetime) < 16) | (hour(datetime) == 16 & minute(datetime) <= 50)) %>%
+    arrange(datetime)
+
+  # agregacja do sekundy:
+  # jeśli w jednej sekundzie było kilka transakcji, liczymy jedną cenę
+  # cena = średnia ważona wolumenem (transakcje z większym wolumenem ważą więcej)
+  df_sec <- df %>%
+    mutate(datetime_sec = floor_date(datetime, unit = "1 second")) %>%
+    group_by(daty, datetime_sec) %>%
+    summarise(
+      datetime = first(datetime_sec), # czas (zaokrąglony do sekundy)
+      cena_sec = weighted.mean(price, w = vol, na.rm = TRUE),  # cena ważona wolumenem
+      wolumen_sec = sum(vol, na.rm = TRUE), # łączny wolumen w tej sekundzie
+      .groups = "drop"
+    ) %>%
+    arrange(datetime)
+
+  # podpisujemy nazwą spółki (by potem rozróżnić w tabelach)
+  df_sec$Spolka <- nazwa
+  df_sec
+}
+
+# wczytujemy i przygotowujemy dane dla obu spółek
+ceny_H <- przygotuj_dane_cenowe("spolkaH.csv", "Spółka H")
+ceny_D <- przygotuj_dane_cenowe("spolkaD.csv", "Spółka D")
+```
+
+Dane zostały ograniczone do notowań ciągłych oraz zagregowane do sekund. Dzięki temu unikamy wielokrotnych transakcji w tej samej sekundzie i uzyskujemy stabilniejszą serię cenową do wyznaczania momentów przekroczenia progu $p_0$. 
+
+## Konstrukcja cenowych czasów trwania dla progu p0
+
+Cenowe czasy trwania wyznaczamy osobno dla każdego dnia notowań, tak aby nie uwzględniać przerw nocnych pomiędzy sesjami giełdowymi. Jako punkt początkowy przyjmujemy cenę oraz moment pierwszej transakcji w danym dniu. Następnie obserwujemy kolejne notowania i mierzymy czas potrzebny do momentu, w którym cena zmieni się o co najmniej ustaloną wartość progową \(p_0\) (zarówno w górę, jak i w dół).
+
+W chwili, gdy zmiana ceny osiągnie lub przekroczy poziom \(p_0\), zapisujemy czas trwania danego epizodu jako cenowy czas trwania. Od tego momentu nowa cena i czas stają się punktem odniesienia dla kolejnego pomiaru, a procedura jest kontynuowana aż do końca sesji giełdowej.
+
+```{r}
+# funkcja wyznaczająca cenowe czasy trwania dla danego progu p0
+# dla każdego dnia osobno szuka momentów, gdy cena zmieniła się o co najmniej p0
+wyznacz_price_durations <- function(df_sec, p0) {
+
+  df_out <- df_sec %>%
+    # liczymy osobno dla każdego dnia (żeby nie liczyć przerw nocnych)
+    group_by(daty) %>%
+    group_modify(~{
+      d <- .x %>% arrange(datetime)
+      # jeśli w danym dniu jest mniej niż 2 obserwacje –> pomijamy
+      if (nrow(d) < 2) return(tibble())
+
+      # punkt startowy: cena i czas pierwszej transakcji dnia
+      ref_price <- d$cena_sec[1]
+      ref_time  <- d$datetime[1]
+
+      # tu zbieramy wszystkie zdarzenia cenowe (momenty przekroczenia progu)
+      zdarzenia <- list()
+
+      # przechodzimy po każdej kolejnej transakcji w danym dniu
+      for (i in 2:nrow(d)) {
+        p_now <- d$cena_sec[i]  # aktualna cena
+        t_now <- d$datetime[i]  # aktualny czas
+
+        # sprawdzamy: czy cena zmieniła się o co najmniej p0 od punktu odniesienia?
+        if (abs(p_now - ref_price) >= p0) {
+          # TAK -> zapisujemy zdarzenie cenowe
+          zdarzenia[[length(zdarzenia) + 1]] <- tibble(
+            tau_start = ref_time,       # kiedy zaczęliśmy liczyć
+            tau_end   = t_now,          # kiedy próg został przekroczony
+            duracja_ceny = as.numeric(difftime(t_now, ref_time, units = "secs")),  # ile sekund to trwało
+            p_start = ref_price, # cena na początku epizodu
+            p_end   = p_now, # cena na końcu epizodu
+            zmiana  = p_now - ref_price # kierunek i wielkość zmiany
+          )
+
+          # reset: nowy punkt odniesienia = aktualna cena i czas
+          ref_price <- p_now
+          ref_time  <- t_now
+        }
+      }
+
+      # zwracamy wszystkie zdarzenia z tego dnia
+      bind_rows(zdarzenia)
+    }) %>%
+    ungroup() %>%
+    # dopisujemy próg i nazwę spółki, żeby potem rozróżnić w tabelach
+    mutate(p0 = p0, Spolka = first(df_sec$Spolka)) %>%
+    # zostawiamy tylko dodatnie czasy trwania
+    filter(duracja_ceny > 0)
+
+  df_out
+}
+```
+
+To implementuje dokładnie ideę "zdarzeń cenowych": każda obserwacja to czas potrzebny do uzyskania zmiany co najmniej p0 Jeśli rynek charakteryzuje się większą zmiennością lub częstszymi ruchami cen, zdarzenia cenowe występują częściej, a odpowiadające im czasy trwania są krótsze.
+
+
+## Dwa progi p0 (1 gr i 5 gr) i konstrukcja szeregów
+
+Dobieramy dwa progi cenowe:
+
+ - \(p_0\) = 0,01 PLN (1 grosz)
+ - \(p_0\) = 0,05 PLN (5 groszy)
+
+Oba progi stosujemy tak samo dla obu spółek, żeby można było bezpośrednio porównać wyniki między nimi. Dobór progów \(p_0\) uwzględnia skalę zmienności cen – jednak pamiętamy że zmiana o 5 gr to dla taniej spółki (H, cena 7–9 PLN) duży ruch cenowy, a dla drogiej spółki (D, cena 400–500 PLN) prawie niezauważalny. Dlatego liczba zdarzeń cenowych i czasy trwania będą się bardzo różnić – co widać w tabeli poniżej.
+
+```{r}
+# progi cenowe
+p0_1 <- 0.01  # próg 1: zmiana o 1 grosz
+p0_2 <- 0.05  # próg 2: zmiana o 5 groszy
+
+# wyznaczamy cenowe czasy trwania dla każdej spółki i każdego progu
+pd_H_1 <- wyznacz_price_durations(ceny_H, p0_1)  # Spółka H, próg 1 gr
+pd_H_2 <- wyznacz_price_durations(ceny_H, p0_2)  # Spółka H, próg 5 gr
+pd_D_1 <- wyznacz_price_durations(ceny_D, p0_1)  # Spółka D, próg 1 gr
+pd_D_2 <- wyznacz_price_durations(ceny_D, p0_2)  # Spółka D, próg 5 gr
+
+# łączymy wszystko w jedną tabelę
+pd_all <- bind_rows(pd_H_1, pd_H_2, pd_D_1, pd_D_2)
+```
+
+```{r}
+# sprawdzamy ile zdarzeń cenowych wyszło dla każdej kombinacji spółka + próg
+pd_all %>%
+  group_by(Spolka, p0) %>%
+  summarise(
+    N_zdarzen = n(), # liczba zdarzeń cenowych
+    Srednia_duracja = mean(duracja_ceny), # średni czas oczekiwania na zmianę ceny
+    .groups = "drop"
+  )
+```
+
+Dla Spółki D liczba zdarzeń jest podobna dla obu progów (128 313 dla 1 gr i 123 541 dla 5 gr), a średni czas trwania też jest podobny (ok. 109 s vs 113 s). To znaczy, że w tej spółce nawet ruch o 5 gr pojawia się dość często – co jest zrozumiałe, bo przy cenie 400–500 PLN zmiana o 5 gr to bardzo mały ułamek ceny.
+
+Dla Spółki H różnica jest ogromna: dla 1 gr mamy 46 617 zdarzeń i średnio ok. 296 s, a dla 5 gr tylko 1 836 zdarzeń i średnio aż ok. 4 994 s. Przy cenie 7–9 PLN zmiana o 5 gr to już duży ruch, dlatego takich zdarzeń jest mało i trzeba na nie długo czekać.
+
+**Wniosek:** dużo transakcji nie musi oznaczać częstych większych zmian ceny – to bardzo dobrze widać dla Spółki H. Mimo że próg 5 gr daje mało zdarzeń dla Spółki H, pozostawiamy go jako wspólny punkt odniesienia dla obu spółek (jest zalecane stosowanie tych samych progów dla obu spółek, jeśli to możliwe).
+
+  
+## Statystyki opisowe (wspólny próg dla obu spółek)
+
+Zgodnie z wytycznymi: wybieramy jeden próg wspólny (sensownie: 5 gr, bo jest bardziej "ekonomicznie istotny" niż 1 gr) i robimy wspólną tabelę statystyk opisowych.
+
+```{r}
+# tabela
+tabela_pd_p005 <- pd_all %>%
+  filter(p0 == 0.05) %>%
+  group_by(Spolka) %>%
+  summarise(
+    N = n(),
+    Srednia = mean(duracja_ceny),
+    Mediana = median(duracja_ceny),
+    Min = min(duracja_ceny),
+    Max = max(duracja_ceny),
+    Odch_Std = sd(duracja_ceny),
+    Skosnosc = moments::skewness(duracja_ceny),
+    Kurtoza = moments::kurtosis(duracja_ceny),
+    Nadwyzkowe_Rozproszenie = sd(duracja_ceny) / mean(duracja_ceny),
+    .groups = "drop"
+  )
+
+tabela_pd_p005 %>%
+  kable(digits = 3, caption = "Statystyki opisowe cenowych czasów trwania (p0 = 0.05 PLN)")
+```
+
+**Wyniki powyższej tabeli:**
+
+ - **Dla Spółki D** średni cenowy czas trwania wynosi około 113 sekund, a mediana jedynie 38 sekund. Tak duża różnica między średnią a medianą oznacza, że większość zdarzeń cenowych trwa krótko, ale zdarzają się też pojedyncze bardzo długie przerwy, które zawyżają średnią. Wysoka skośność (4,9) i kurtoza (46,4) potwierdzają ten nierównomierny rozkład.
+
+ - **Dla Spółki H** czasy trwania są wielokrotnie dłuższe, średnio blisko 5000 sekund, mediana ok. 2588 sekund. Zmiana ceny o 5 gr jest dla tej taniej spółki zdarzeniem rzadkim i wymaga długiego czekania.
+
+Porównanie obu spółek przy progu 5 gr pokazuje, że wysoka płynność transakcyjna nie musi automatycznie oznaczać szybszego osiągania większych zmian cenowych. Spółka H handluje bardzo często, jednak ze względu na jej niską cenę nominalną, wygenerowanie ruchu o 5 gr wymaga dłuższego czasu (akumulacji mniejszych zmian) w porównaniu do droższej Spółki D, dla której 5 gr to minimalny ułamek wartości.
+
+## Przekrojowe średnie cenowych czasów trwania dla dwóch progów (osobno dla każdej spółki)
+
+Dla cenowych czasów trwania liczebności w koszykach mogą być mniejsze niż w transakcyjnych czasach trwania (bo zdarzenia cenowe są rzadsze). Dlatego wybieramy sensowny kompromis: 10-minutowe koszyki dla obu naszych spółek, aby:
+
+ - nie "przeszarpać" wykresu dla Spółki D,
+ - nadal zachować detal dla Spółki H.
+
+```{r}
+# przygotowujemy dane do wykresu przekrojowych średnich price durations
+pd_plot <- pd_all %>%
+  mutate(
+    # zaokrąglamy czas zdarzenia do 10-minutowych koszyków
+    czas_bin = floor_date(tau_end, unit = "10 minutes"),
+    # wyciągamy samą godzinę (bez daty), żeby nałożyć na siebie różne dni
+    czas_dnia = hms::as_hms(czas_bin),
+    # etykieta progu do legendy wykresu
+    prog = factor(p0, levels = c(0.01, 0.05), labels = c("p0 = 0.01", "p0 = 0.05"))
+  ) %>%
+  # dla każdej spółki, progu i okna 10-minutowego liczymy średnią
+  group_by(Spolka, prog, czas_dnia) %>%
+  summarise(
+    n = n(),  # ile zdarzeń cenowych w tym oknie
+    Srednia_PD = mean(duracja_ceny, na.rm = TRUE),  # średni czas trwania ceny
+    .groups = "drop"
+  ) %>%
+  # zostawiamy tylko okna z min. 10 zdarzeniami, żeby średnia była wiarygodna
+  filter(n >= 10)
+
+# wykres: osobny panel dla każdej spółki, dwie linie = dwa progi
+ggplot(pd_plot, aes(x = czas_dnia, y = Srednia_PD, color = prog)) +
+  geom_line(linewidth = 0.9) +
+  # osobny panel dla każdej spółki, z własną skalą Y
+  facet_wrap(~Spolka, ncol = 1, scales = "free_y") +
+  labs(
+    title = "Przekrojowe średnie cenowych czasów trwania",
+    subtitle = "Interwały 10-minutowe, dwa progi p0 (skala logarytmiczna osi Y)",
+    x = "Godzina sesji",
+    y = "Średni czas trwania ceny (skala log10, sekundy)",
+    color = "Próg p0"
+  ) +
+  theme_minimal() +
+  scale_y_log10() + 
+  # oś czasu: co godzinę, zakres 9:00-16:50
+  scale_x_time(
+    breaks = scales::date_breaks("1 hour"),
+    labels = scales::time_format("%H:%M"),
+    limits = c(hms::as_hms("09:00:00"), hms::as_hms("16:50:00"))
+  ) +
+  theme(legend.position = "bottom")
+```
+
+Powyższy wykres przedstawia średnie cenowe czasy trwania w interwałach 10-minutowych dla obu progów cenowych (p0 = 0,01 i p0 = 0,05 PLN). Cenowy czas trwania to czas, jaki musi upłynąć, aby cena zmieniła się co najmniej o wybrany próg. Wyższe wartości na wykresie oznaczają, że na taką zmianę trzeba dłużej czekać. Przy większym progu (5 gr vs 1 gr) czasy są dłuższe, bo wymaga to większego ruchu ceny.
+
+**Spółka D:** obie linie (p0 = 0,01 i p0 = 0,05) biegną bardzo blisko siebie w przedziale 60–160 sekund. Oznacza to, że zarówno zmiana o 1 grosz, jak i o 5 groszy pojawia się w tej spółce stosunkowo często i w podobnym tempie. Jest to zrozumiałe, bo przy cenie 400–500 PLN oba progi stanowią minimalny ułamek ceny. Widoczna jest też umiarkowana sezonowość śróddzienna – w środku sesji (ok. 12:00–14:00) czasy trwania są nieco dłuższe (rzadsze zmiany ceny), a na początku i końcu sesji krótsze (większa aktywność cenowa).
+
+**Spółka H:** zastosowano logarytmiczną skalę osi Y, co chroni mniejsze wartości przed 'spłaszczeniem' przez bardzo wysokie wartości drugiego progu. Dzięki temu wyraźnie widać, że linia p0 = 0,01 wcale nie jest płaska – wykazuje ona własną, wyraźną dynamikę i zmienność w trakcie sesji (średnie czasy trwania na poziomie kilkuset sekund). Z kolei linia p0 = 0,05 znajduje się znacznie wyżej, osiągając wartości rzędu kilku tysięcy sekund (nawet ponad 10 000 s). Oznacza to, że choć zmiany o 1 grosz są stosunkowo szybkie, to na zmianę ceny o 5 groszy w tej taniej spółce trzeba czekać bardzo długo.
+
+Porównanie obu paneli prowadzi do istotnych wniosków. Przy progu p0=0,01 PLN zmiany są szybsze (czasy trwania są krótsze) w Spółce H w porównaniu ze Spółką D, co jest bezpośrednim efektem jej wyższej płynności transakcyjnej. Jednakże ze względu na drastyczną różnicę w poziomach cen akcji obu spółek (7-9 PLN dla H vs 400-500 PLN dla D), próg 5 gr stanowi dla taniej spółki znaczący ruch procentowy. Dlatego też osiągnięcie wyższego progu w Spółce H wymaga dłuższego czasu oczekiwania na silniejsze impulsy rynkowe, podczas gdy dla Spółki D stanowi on jedynie minimalny ułamek ceny, przez co przekroczenia tego progu następują tam znacznie szybciej.
+
+# Wnioski końcowe
+
+Analiza transakcyjnych czasów trwania pokazała wyraźne różnice w częstości zawierania transakcji między naszymi badanymi spółkami. **Spółka H** charakteryzuje się krótkimi przerwami między transakcjami, co oznacza wysoką płynność, natomiast dla **Spółki D** transakcje pojawiają się rzadziej. W obu przypadkach transakcje nie występują równomiernie w czasie, lecz grupują się w okresach większej i mniejszej aktywności.
+
+**Analiza cenowych czasów trwania** wykazała, że duża liczba transakcji nie musi oznaczać częstych zmian ceny. **Dla Spółki H** większe zmiany ceny pojawiają się rzadko i wymagają długiego czasu, natomiast dla **Spółki D** takie zmiany występują znacznie częściej, co wskazuje na większą zmienność ceny. Usunięcie śróddziennej sezonowości pozwoliło nam wyeliminować powtarzalne wzorce w trakcie sesji i lepiej ocenić rzeczywistą zmienność czasów trwania.
+
+**Zestawienie obu części** pokazuje, że płynność transakcyjna i aktywność cenowa to dwa odrębne, ale powiązane wymiary rynku, które są mocno uzależnione od nominalnej ceny akcji. Przy niskich progach (1 gr) wyższa liczba transakcji (Spółka H) przekłada się na szybsze zmiany ceny. Jednak przy wyższych progach (5 gr) czas oczekiwania drastycznie rośnie dla spółki taniej, a pozostaje krótki dla spółki drogiej (Spółka D), dla której taki ruch stanowi zaledwie ułamek procenta wartości. Dlatego pełna analiza mikrostruktury wymaga badania obu rodzajów czasów trwania łącznie, z uwzględnieniem specyfiki cenowej każdej spółki.
+
+

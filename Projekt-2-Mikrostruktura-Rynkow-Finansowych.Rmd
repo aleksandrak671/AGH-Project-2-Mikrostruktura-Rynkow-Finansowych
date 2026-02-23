@@ -1,6 +1,6 @@
 ---
 title: "Mikrostruktura Rynków Finansowych Projekt 2: Transakcyjne czasy trwania i Czasy trwania ceny"
-author: "Klaudia Rajca, Aleksandra Konopelska"
+author: "K.R, Aleksandra Konopelska"
 date: "`r Sys.Date()`"
 output: 
   html_document:
@@ -672,5 +672,6 @@ Analiza transakcyjnych czasów trwania pokazała wyraźne różnice w częstośc
 **Analiza cenowych czasów trwania** wykazała, że duża liczba transakcji nie musi oznaczać częstych zmian ceny. **Dla Spółki H** większe zmiany ceny pojawiają się rzadko i wymagają długiego czasu, natomiast dla **Spółki D** takie zmiany występują znacznie częściej, co wskazuje na większą zmienność ceny. Usunięcie śróddziennej sezonowości pozwoliło nam wyeliminować powtarzalne wzorce w trakcie sesji i lepiej ocenić rzeczywistą zmienność czasów trwania.
 
 **Zestawienie obu części** pokazuje, że płynność transakcyjna i aktywność cenowa to dwa odrębne, ale powiązane wymiary rynku, które są mocno uzależnione od nominalnej ceny akcji. Przy niskich progach (1 gr) wyższa liczba transakcji (Spółka H) przekłada się na szybsze zmiany ceny. Jednak przy wyższych progach (5 gr) czas oczekiwania drastycznie rośnie dla spółki taniej, a pozostaje krótki dla spółki drogiej (Spółka D), dla której taki ruch stanowi zaledwie ułamek procenta wartości. Dlatego pełna analiza mikrostruktury wymaga badania obu rodzajów czasów trwania łącznie, z uwzględnieniem specyfiki cenowej każdej spółki.
+
 
 
